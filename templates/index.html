@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GenZ Bros - Home</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/index.css') }}">
+</head>
+<body>
+  <!-- Top Tabs / Header -->
+  <header class="site-header">
+    <div class="tabs">
+      <button disabled>Feed</button>
+      <button onclick="location.href='/chat'">Chat</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="user-info">
+      <span>Logged in as: {{ username }}</span>
+      <button class="logout-btn" onclick="location.href='/logout'">Logout</button>
+    </div>
+  </header>
+
+  <!-- Wrapping main content so header stays at top -->
+  <main class="page-wrap">
+    <!-- Upload Form -->
+    <section class="upload-section">
+      <form id="uploadForm" enctype="multipart/form-data" onsubmit="return false;" class="upload-form">
+        <input type="text" id="titleInput" placeholder="Title (optional)" class="title-input">
+
+        <!-- file input + visible filename -->
+        <!-- replace the existing inline-div around the file input -->
+<div class="file-row">
+  <input type="file" id="fileInput" class="file-input" />
+  <span id="fileNameDisplay" class="file-name-display">No file selected</span>
+</div>
+
+        <button id="uploadBtn" class="upload-btn" type="button">Upload</button>
+
+        <div class="progress-wrap" id="progressWrap">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <div id="uploadMsg" class="upload-msg"></div>
+      </form>
+    </section>
+
+    <!-- Filter Controls -->
+    <div class="filter-controls">
+      <button class="filter-btn" data-type="image">Images</button>
+      <button class="filter-btn" data-type="video">Videos</button>
+      <button class="filter-btn" data-type="audio">Audios</button>
+    </div>
+
+    <!-- Gallery -->
+    <section class="gallery-section">
+      <h3>Gallery</h3>
+
+      <!-- placeholder if no content -->
+      {% if files_meta|length == 0 %}
+        <div class="gallery-placeholder">No uploads yet — use the upload form above to add content.</div>
+      {% endif %}
+
+      <div id="gallery" class="gallery-grid">
+        {% for it in files_meta %}
+          <div class="gallery-item {% if it.mimetype in ['mp4','mov','webm','mkv'] %}video-container{% elif it.mimetype in ['mp3','wav','ogg'] %}audio-container{% else %}img-container{% endif %}"
+               data-id="{{ it.id }}"
+               data-file="{{ it.stored_filename }}"
+               data-type="{{ it.mimetype }}"
+               data-title="{{ it.title|e }}"
+               data-original="{{ it.original_filename|e }}"
+               data-uploader="{{ it.uploader|e }}">
+            <div class="meta">
+                <div class="meta-title">{{ it.title }}</div>
+                <div class="small">Uploaded by: <strong>{{ it.uploader }}</strong></div>
+            </div>
+
+            {% set sf = it.stored_filename %}
+            {% if it.mimetype in ['mp4','mov','webm','mkv'] %}
+                <img src="{{ url_for('serve_upload', filename=sf) }}?thumb=1" class="thumb" alt="{{ it.title }}">
+            {% elif it.mimetype in ['mp3','wav','ogg'] %}
+                <div class="audio-thumb" style="width:100%;height:140px;display:flex;align-items:center;justify-content:center;border-radius:8px;background:rgba(255,255,255,0.03);">
+                  <div style="text-align:center;">
+                    <div style="font-weight:600;">Audio</div>
+                    <div style="font-size:0.85rem;">{{ it.original_filename }}</div>
+                  </div>
+                </div>
+            {% else %}
+                <img src="{{ url_for('serve_upload', filename=sf) }}" class="img-file" alt="{{ it.title }}">
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    </section>
+  </main>
+
+  <!-- MEDIA MODAL (hidden by default) -->
+  <div id="mediaModal" class="modal hidden" aria-hidden="true" role="dialog" aria-modal="true">
+    <div class="modal-content" role="document">
+      <span class="close-btn" title="Close">&times;</span>
+      <div class="modal-meta" style="width:100%;display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <div style="flex:1;min-width:0;">
+          <div id="modalTitle" class="meta-title" style="font-size:1.1rem;word-break:break-word;"></div>
+          <div id="modalUploader" class="small" style="margin-top:4px;"></div>
+        </div>
+        <div id="modalActions" style="display:flex;gap:8px;align-items:center;"></div>
+      </div>
+      <div class="media-container" style="width:100%;display:flex;justify-content:center;align-items:center;margin-top:12px;"></div>
+      <div class="modal-comments" style="width:100%;margin-top:12px;">
+        <div id="modalCommentsList" class="comments-list" style="max-height:220px;overflow:auto;padding:6px 4px;"></div>
+        <form id="modalCommentForm" class="comment-form" onsubmit="return false;" style="margin-top:8px;display:flex;gap:8px;">
+          <input id="modalCommentInput" class="comment-input" placeholder="Add a comment" style="flex:1;padding:8px;border-radius:6px;border:none;">
+          <button id="modalCommentSend" class="comment-send" style="padding:8px 10px;border-radius:6px;">Send</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ==== tiny addition: show selected filename ==== */
+(function(){
+  const fileInput = document.getElementById('fileInput');
+  const fileNameDisplay = document.getElementById('fileNameDisplay');
+
+  if (fileInput && fileNameDisplay) {
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files && fileInput.files.length > 0) {
+        fileNameDisplay.textContent = fileInput.files[0].name;
+      } else {
+        fileNameDisplay.textContent = 'No file selected';
+      }
+    });
+  }
+})();
+</script>
+<script>
+/* ============================
+   Gallery -> Modal interaction
+   ============================
+   - open modal on click of .gallery-item
+   - render media (img/video/audio) inside modal (fit, not crop)
+   - show actions (edit/delete) if user is uploader
+   - comments inside modal (fetch + post)
+   - close modal cleans up media and stops playback
+*/
+let lastMetaTimestamp = null;
+let pendingUpdate = false;
+
+// config
+const allowed = ['jpg','jpeg','png','gif','mp4','mov','webm','mkv','mp3','wav','ogg', 'aac'];
+const videoTypes = ['mp4','mov','webm','mkv'];
+const audioTypes = ['mp3','wav','ogg', 'aac'];
+const maxSize = 1 * 1024 * 1024 * 1024; // 1GB
+
+// helpers
+const $ = sel => document.querySelector(sel);
+const $$ = sel => Array.from(document.querySelectorAll(sel));
+
+function findMetaById(id) {
+  // fetch metadata and find entry (simple approach)
+  return fetch('/metadata').then(r => r.json()).then(list => list.find(x => x.id === id));
+}
+
+function setTextSafe(el, txt) {
+  el.textContent = txt || '';
+}
+
+// modal elements
+const modal = $('#mediaModal');
+const modalContent = modal.querySelector('.modal-content');
+const modalClose = modal.querySelector('.close-btn');
+const mediaContainer = modal.querySelector('.media-container');
+const modalTitle = $('#modalTitle');
+const modalUploader = $('#modalUploader');
+const modalActions = $('#modalActions');
+const modalCommentsList = $('#modalCommentsList');
+const modalCommentInput = $('#modalCommentInput');
+const modalCommentForm = $('#modalCommentForm');
+const modalCommentSend = $('#modalCommentSend');
+
+let currentItem = null; // will hold {id, file, type, title, uploader, original}
+
+// open modal with item data (object)
+async function openModal(item) {
+  currentItem = item;
+
+  // set title/uploader (render title escaped)
+  setTextSafe(modalTitle, item.title || item.original || 'Untitled');
+  setTextSafe(modalUploader, 'Uploaded by: ' + (item.uploader || 'Unknown'));
+
+  // clear previous
+  mediaContainer.innerHTML = '';
+  modalActions.innerHTML = '';
+  modalCommentsList.innerHTML = '';
+
+  // create media element depending on type
+  const ext = (item.type || '').toLowerCase();
+  const fileUrl = '/uploads/' + item.file;
+
+  if (videoTypes.includes(ext)) {
+    const video = document.createElement('video');
+    video.controls = true;
+    video.preload = 'metadata';
+    video.style.maxWidth = '100%';
+    video.style.maxHeight = '70vh';
+    video.style.width = 'auto';
+    video.style.height = 'auto';
+    video.style.objectFit = 'contain';
+    video.src = fileUrl;
+    mediaContainer.appendChild(video);
+  } else if (audioTypes.includes(ext)) {
+    const audioWrap = document.createElement('div');
+    audioWrap.style.width = '100%';
+    audioWrap.style.display = 'flex';
+    audioWrap.style.flexDirection = 'column';
+    audioWrap.style.alignItems = 'center';
+    audioWrap.style.gap = '8px';
+    const audio = document.createElement('audio');
+    audio.controls = true;
+    audio.preload = 'none';
+    audio.style.width = '100%';
+    audio.src = fileUrl;
+    audioWrap.appendChild(audio);
+    // show original filename under audio
+    const label = document.createElement('div');
+    label.className = 'small';
+    label.textContent = item.original || item.title || '';
+    audioWrap.appendChild(label);
+    mediaContainer.appendChild(audioWrap);
+  } else {
+    // image (or fallback)
+    const img = document.createElement('img');
+    img.style.maxWidth = '100%';
+    img.style.maxHeight = '80vh';
+    img.style.width = 'auto';
+    img.style.height = 'auto';
+    img.style.objectFit = 'contain';
+    img.src = fileUrl;
+    mediaContainer.appendChild(img);
+  }
+
+  // actions: Edit / Delete (if uploader) + Download + Close handled outside
+  // Show Edit/Delete only if current user is uploader
+  const me = "{{ username }}"; // server-rendered username
+  if (me && item.uploader === me) {
+    const editBtn = document.createElement('button');
+    editBtn.textContent = 'Edit';
+    editBtn.addEventListener('click', onEditTitle);
+    modalActions.appendChild(editBtn);
+
+    const delBtn = document.createElement('button');
+    delBtn.textContent = 'Delete';
+    delBtn.addEventListener('click', onDelete);
+    modalActions.appendChild(delBtn);
+  }
+
+  // Download button (visible to all)
+  const dlBtn = document.createElement('button');
+  dlBtn.textContent = 'Download';
+  dlBtn.addEventListener('click', () => {
+    const a = document.createElement('a');
+    a.href = fileUrl;
+    a.download = item.original || item.file;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+  modalActions.appendChild(dlBtn);
+
+  // Load comments for this item
+  await loadComments(item.id);
+
+  // focus comment input
+  modalCommentInput.value = '';
+  modalCommentInput.focus?.();
+
+  // show modal
+  modal.classList.remove('hidden');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+// ---------- Upload with progress ----------
+document.getElementById('uploadBtn').addEventListener('click', async (e) => {
+  e.preventDefault();
+  const fileInput = document.getElementById('fileInput');
+  const title = document.getElementById('titleInput').value || '';
+  if(!fileInput.files.length) return alert('Select a file');
+  const file = fileInput.files[0];
+  const ext = file.name.split('.').pop().toLowerCase();
+  if(!allowed.includes(ext)) return alert('Invalid file type');
+  if(file.size > maxSize) return alert('File too large (max 1GB)');
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('title', title);
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/upload', true);
+
+  const progressWrap = document.getElementById('progressWrap');
+  const progressBar = document.getElementById('progressBar');
+  const uploadMsg = document.getElementById('uploadMsg');
+  progressWrap.style.display = 'block';
+  progressBar.style.width = '0%';
+  uploadMsg.textContent = 'Uploading...';
+
+  xhr.upload.onprogress = function(e) {
+    if(e.lengthComputable) {
+      const pct = Math.round((e.loaded / e.total) * 100);
+      progressBar.style.width = pct + '%';
+    }
+  };
+
+  xhr.onreadystatechange = function() {
+    if(xhr.readyState === 4) {
+      progressWrap.style.display = 'none';
+      if(xhr.status === 200) {
+        const res = JSON.parse(xhr.responseText);
+        if(res.status === 'ok') {
+          uploadMsg.textContent = 'Upload finished';
+          // reload page to fetch new metadata including thumbnail (simple)
+          setTimeout(()=> location.reload(), 700);
+        } else {
+          uploadMsg.textContent = 'Error: ' + (res.msg || 'upload failed');
+        }
+      } else {
+        uploadMsg.textContent = 'Upload failed (server error)';
+      }
+    }
+  };
+
+  xhr.send(fd);
+});
+
+// close modal and cleanup
+function closeModal() {
+  // stop any playing media
+  const media = mediaContainer.querySelector('video, audio');
+  if (media) {
+    try { media.pause(); } catch (e) {}
+    media.src = '';
+    if (typeof media.load === 'function') media.load();
+  }
+
+  // cleanup modal contents
+  mediaContainer.innerHTML = '';
+
+  // hide modal
+  modal.classList.add('hidden');
+  modal.setAttribute('aria-hidden', 'true');
+
+  // remove update notice if present
+  const updateNotice = document.getElementById('modalUpdateNotice');
+  if (updateNotice) updateNotice.remove();
+
+  const hadPending = pendingUpdate;
+  pendingUpdate = false;
+  currentItem = null;
+
+  // refresh if there was a pending update
+  if (hadPending) {
+    console.log('Pending update detected — reloading after modal close.');
+    setTimeout(() => location.reload(), 150);
+  }
+}
+
+// load comments from /metadata (find item.comments) and render
+async function loadComments(itemId) {
+  modalCommentsList.innerHTML = 'Loading...';
+  try {
+    const meta = await fetch('/metadata').then(r => r.json());
+    const it = meta.find(x => x.id === itemId);
+    modalCommentsList.innerHTML = '';
+    if (!it) {
+      modalCommentsList.textContent = 'No comments';
+      return;
+    }
+    const comments = it.comments || [];
+    if (comments.length === 0) {
+      modalCommentsList.textContent = 'No comments yet';
+      return;
+    }
+    for (const c of comments) {
+      const div = document.createElement('div');
+      div.className = 'comment';
+      div.innerHTML = `<strong>${escapeHtml(c.user)}</strong> — ${escapeHtml(c.text)}`;
+      modalCommentsList.appendChild(div);
+    }
+  } catch (err) {
+    modalCommentsList.textContent = 'Failed to load comments';
+    console.error(err);
+  }
+}
+
+// send comment
+async function sendComment() {
+  if (!currentItem) return;
+  const text = modalCommentInput.value.trim();
+  if (!text) return;
+  
+  // Disable button to prevent double submission
+  modalCommentSend.disabled = true;
+  
+  const fd = new FormData();
+  fd.append('text', text);
+  try {
+    const res = await fetch('/comment/' + currentItem.id, { method:'POST', body: fd });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      // append comment
+      const div = document.createElement('div');
+      div.className = 'comment';
+      div.innerHTML = `<strong>${escapeHtml(data.comment.user)}</strong> — ${escapeHtml(data.comment.text)}`;
+      modalCommentsList.appendChild(div);
+      modalCommentInput.value = '';
+    } else {
+      alert(data.msg || 'Comment failed');
+    }
+  } catch (err) {
+    console.error('Comment submission failed:', err);
+    alert('Failed to submit comment');
+  } finally {
+    modalCommentSend.disabled = false;
+  }
+}
+
+// edit title
+async function onEditTitle() {
+  if (!currentItem) return;
+  const newTitle = prompt('Edit title:', currentItem.title || '');
+  if (newTitle === null) return;
+  const fd = new FormData();
+  fd.append('title', newTitle);
+  const resp = await fetch('/edit/' + currentItem.id, { method: 'POST', body: fd });
+  const data = await resp.json();
+  if (data.status === 'ok') {
+    currentItem.title = data.title;
+    setTextSafe(modalTitle, data.title);
+    // update grid item title
+    const gi = document.querySelector(`.gallery-item[data-id="${currentItem.id}"] .meta-title`);
+    if (gi) gi.textContent = data.title;
+  } else {
+    alert(data.msg || 'Edit failed');
+  }
+}
+
+// delete
+async function onDelete() {
+  if (!currentItem) return;
+  if (!confirm('Delete this file?')) return;
+  const resp = await fetch('/delete/' + currentItem.id, { method: 'POST' });
+  const data = await resp.json();
+  if (data.status === 'ok') {
+    // remove gallery item
+    const gi = document.querySelector(`.gallery-item[data-id="${currentItem.id}"]`);
+    if (gi) gi.remove();
+    closeModal();
+  } else {
+    alert(data.msg || 'Delete failed');
+  }
+}
+
+/* Utility: escape html */
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]; });
+}
+
+/* --------------------------
+   Event delegation: open modal on click
+   -------------------------- */
+document.getElementById('gallery').addEventListener('click', async (e) => {
+  // find gallery-item ancestor
+  const itemEl = e.target.closest('.gallery-item');
+  if (!itemEl) return;
+
+  // build item object from data- attributes
+  const item = {
+    id: itemEl.dataset.id,
+    file: itemEl.dataset.file,
+    type: itemEl.dataset.type,
+    title: itemEl.dataset.title,
+    original: itemEl.dataset.original,
+    uploader: itemEl.dataset.uploader
+  };
+
+  // open modal with freshest metadata (merge comments/title if changed)
+  const fresh = await findMetaById(item.id).catch(()=>null);
+  if (fresh) {
+    item.title = fresh.title || item.title;
+    item.original = fresh.original_filename || item.original;
+    item.uploader = fresh.uploader || item.uploader;
+  }
+
+  openModal(item);
+});
+
+/* Close modal on close button, or click outside modal-content */
+modalClose.addEventListener('click', closeModal);
+modal.addEventListener('click', function(e) {
+  if (e.target === modal) closeModal();
+});
+// escape key
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal(); });
+
+/* Comment send */
+modalCommentSend.addEventListener('click', sendComment);
+modalCommentForm.addEventListener('submit', (e) => { e.preventDefault(); sendComment(); });
+
+/* Keep metadata polling (existing behavior) — page will reload when metadata changes */
+if (window.location.pathname === '/home') {
+  async function checkForUpdates() {
+    try {
+      const res = await fetch('/metadata_timestamp', { cache: 'no-store' });
+      const data = await res.json();
+      const serverTs = data.timestamp;
+
+      if (lastMetaTimestamp === null) {
+        // first time — just set it
+        lastMetaTimestamp = serverTs;
+      } else if (serverTs !== lastMetaTimestamp) {
+        const modalOpen = !(modal.classList.contains('hidden') || modal.getAttribute('aria-hidden') === 'true');
+
+        if (!modalOpen) {
+          // modal closed → safe to refresh immediately
+          lastMetaTimestamp = serverTs;
+          console.log('Metadata changed, reloading now.');
+          location.reload();
+          return;
+        } else {
+          // modal open → defer update
+          pendingUpdate = true;
+          lastMetaTimestamp = serverTs;
+          console.log('Metadata changed while modal open, will reload after modal closes.');
+
+          // ✅ insert the notice snippet HERE 👇
+          const noticeId = 'modalUpdateNotice';
+          if (!document.getElementById(noticeId)) {
+            const notice = document.createElement('div');
+            notice.id = noticeId;
+            notice.textContent = '🔄 New content is available — it will appear after you close this viewer.';
+            notice.style.fontSize = '0.9rem';
+            notice.style.color = '#ffd';
+            notice.style.marginTop = '8px';
+            notice.style.textAlign = 'center';
+            modalContent.appendChild(notice);
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Update check failed:', err);
+    } finally {
+      setTimeout(checkForUpdates, 5000);
+    }
+  }
+
+  checkForUpdates();
+}
+
+const filterButtons = document.querySelectorAll('.filter-btn');
+const galleryItems = document.querySelectorAll('.gallery-item');
+
+// Track selected types
+let activeFilters = new Set();
+
+filterButtons.forEach(btn => {
+  btn.addEventListener('click', () => {
+    const type = btn.dataset.type;
+
+    // toggle active state
+    if (activeFilters.has(type)) {
+      activeFilters.delete(type);
+      btn.classList.remove('active');
+    } else {
+      activeFilters.add(type);
+      btn.classList.add('active');
+    }
+
+    applyFilters();
+  });
+});
+
+function applyFilters() {
+  if (activeFilters.size === 0) {
+    // show all
+    galleryItems.forEach(item => item.style.display = '');
+    return;
+  }
+
+  galleryItems.forEach(item => {
+    const type = item.classList.contains('img-container') ? 'image'
+                : item.classList.contains('video-container') ? 'video'
+                : item.classList.contains('audio-container') ? 'audio'
+                : null;
+
+    if (activeFilters.has(type)) {
+      item.style.display = '';
+    } else {
+      item.style.display = 'none';
+    }
+  });
+}
+</script>
+</body>
+</html>

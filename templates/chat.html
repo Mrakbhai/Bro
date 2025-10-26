@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chat - GenZ Bros</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/base.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}">
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body class="chat-page">
+<header class="site-header">
+  <div class="tabs">
+    <button onclick="location.href='/home'">Feed</button>
+    <button disabled>Chat</button>
+  </div>
+  <div class="spacer"></div>
+  <div class="user-info">
+    <span>Logged in as: {{ username }}</span>
+    <button class="logout-btn" onclick="location.href='/logout'">Logout</button>
+  </div>
+</header>
+
+<div id="messages" aria-live="polite"></div>
+
+<form id="chatForm">
+    <input type="text" id="msgInput" placeholder="Type a message">
+    <button type="submit">Send</button>
+</form>
+
+<script>
+/*
+  Rewritten chat client script
+  - PBKDF2 -> AES-GCM shared passphrase
+  - Ensures key derivation completes before sending encrypted messages
+  - Graceful fallback to plaintext
+  - Encryption status UI + change passphrase helper
+*/
+
+/* ---------- config & helpers ---------- */
+const PBKDF2_SALT = 'genz-bros-chat-salt-v1';
+const PBKDF2_ITER = 150_000;
+const AES_KEY_LEN = 256;
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+let sharedKey = null;            // CryptoKey when a passphrase is set
+let passphraseUsed = null;       // last passphrase (plain only in memory)
+let derivingPromise = null;      // Promise while deriving key
+let ready = false;               // true when page is ready to send (plaintext allowed)
+
+/* DOM refs */
+const messagesDiv = document.getElementById('messages');
+const chatForm = document.getElementById('chatForm');
+const msgInput = document.getElementById('msgInput');
+
+/* add encryption status indicator + change button */
+const statusBar = document.createElement('div');
+statusBar.style.margin = '8px';
+statusBar.style.fontSize = '0.9rem';
+statusBar.innerHTML = 'Encryption status: <strong id="encStatus">initialising...</strong> ';
+const changeBtn = document.createElement('button');
+changeBtn.type = 'button';
+changeBtn.textContent = 'Change passphrase';
+changeBtn.style.marginLeft = '8px';
+changeBtn.onclick = promptChangePassphrase;
+statusBar.appendChild(changeBtn);
+document.body.insertBefore(statusBar, document.body.children[2]);
+const encStatusSpan = document.getElementById ? document.getElementById('encStatus') : null;
+
+/* base64 helpers (works for moderate sizes) */
+function abToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  // faster loop for browser
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+function base64ToAb(base64) {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+/* ---------- crypto: derive / encrypt / decrypt ---------- */
+async function deriveKeyFromPassphrase(passphrase) {
+  if (!window.crypto || !crypto.subtle) throw new Error('WebCrypto not available');
+  const passKey = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(passphrase),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+  const saltBuf = encoder.encode(PBKDF2_SALT);
+  const key = await crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: saltBuf,
+      iterations: PBKDF2_ITER,
+      hash: 'SHA-256'
+    },
+    passKey,
+    { name: 'AES-GCM', length: AES_KEY_LEN },
+    false,
+    ['encrypt', 'decrypt']
+  );
+  return key;
+}
+
+async function setPassphrase(pass) {
+  // pass === '' or null => plaintext mode
+  if (!pass) {
+    sharedKey = null;
+    passphraseUsed = null;
+    derivingPromise = null;
+    ready = true;
+    updateStatus('Plaintext (encryption disabled)');
+    console.info('[chat] encryption disabled (plaintext mode)');
+    return;
+  }
+
+  // start derivation and store the promise so submit waits if user tries to send early
+  updateStatus('Deriving key…');
+  passphraseUsed = pass;
+  derivingPromise = deriveKeyFromPassphrase(pass)
+    .then(k => {
+      sharedKey = k;
+      ready = true;
+      updateStatus('Encrypted (passphrase set)');
+      console.info('[chat] derived key from passphrase');
+      return k;
+    })
+    .catch(err => {
+      sharedKey = null;
+      ready = true; // allow plaintext fallback
+      updateStatus('Derivation failed — plaintext fallback');
+      console.error('[chat] deriveKey failed:', err);
+      return null;
+    })
+    .finally(() => { derivingPromise = null; });
+
+  return derivingPromise;
+}
+
+async function encryptMessageText(plaintext) {
+  if (!sharedKey) throw new Error('No shared key');
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    sharedKey,
+    encoder.encode(plaintext)
+  );
+  const combined = new Uint8Array(iv.byteLength + ct.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ct), iv.byteLength);
+  return abToBase64(combined.buffer);
+}
+
+async function decryptMessageBase64(base64Payload) {
+  if (!sharedKey) throw new Error('No shared key');
+  const buf = base64ToAb(base64Payload);
+  const all = new Uint8Array(buf);
+  if (all.length < 13) throw new Error('Payload too small');
+  const iv = all.slice(0, 12);
+  const ct = all.slice(12).buffer;
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    sharedKey,
+    ct
+  );
+  return decoder.decode(plainBuf);
+}
+
+/* ---------- status helper ---------- */
+function updateStatus(msg) {
+  if (encStatusSpan) encStatusSpan.textContent = msg;
+}
+
+/* ---------- media detection & rendering (kept mostly as you had it) ---------- */
+const urlRegex = /(https?:\/\/[^\s]+)/g;
+
+function createTextNodeEscaped(s) {
+  return document.createTextNode(s);
+}
+
+async function detectMediaType(url) {
+  try {
+    const res = await fetch(url, { method: "HEAD" });
+    const type = res.headers.get("Content-Type") || "";
+    return type.split(";")[0].trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+async function renderMessageContentNodes(text) {
+  const nodes = [];
+  if (!text) return nodes;
+  const parts = text.split(/\s+/);
+
+  for (const word of parts) {
+    if (!/^https?:\/\//i.test(word)) {
+      nodes.push(document.createTextNode(word + " "));
+      continue;
+    }
+    const url = word;
+
+    if (url.includes("youtube.com/watch?v=") || url.includes("youtu.be/")) {
+      const vidId = url.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{6,})/);
+      if (vidId && vidId[1]) {
+        const iframe = document.createElement("iframe");
+        iframe.src = `https://www.youtube.com/embed/${vidId[1]}`;
+        iframe.allowFullscreen = true;
+        iframe.className = "chat-media";
+        iframe.loading = "lazy";
+        nodes.push(iframe);
+        continue;
+      }
+    }
+    if (url.includes("vimeo.com/")) {
+      const vidId = url.match(/vimeo\.com\/(\d+)/);
+      if (vidId && vidId[1]) {
+        const iframe = document.createElement("iframe");
+        iframe.src = `https://player.vimeo.com/video/${vidId[1]}`;
+        iframe.allowFullscreen = true;
+        iframe.className = "chat-media";
+        iframe.loading = "lazy";
+        nodes.push(iframe);
+        continue;
+      }
+    }
+
+    if (/\.(jpe?g|png|gif|webp|bmp)$/i.test(url)) {
+      const img = document.createElement("img");
+      img.src = url;
+      img.className = "chat-media";
+      img.alt = "image";
+      img.loading = "lazy";
+      nodes.push(img);
+      continue;
+    }
+    if (/\.(mp4|webm|ogg|mov|mkv)$/i.test(url)) {
+      const video = document.createElement("video");
+      video.src = url;
+      video.controls = true;
+      video.className = "chat-media";
+      video.preload = "none";
+      nodes.push(video);
+      continue;
+    }
+    if (/\.(mp3|wav|aac|m4a|oga)$/i.test(url)) {
+      const audio = document.createElement("audio");
+      audio.src = url;
+      audio.controls = true;
+      audio.className = "chat-media";
+      audio.preload = "none";
+      nodes.push(audio);
+      continue;
+    }
+
+    const mime = await detectMediaType(url);
+    if (mime.startsWith("image/")) {
+      const img = document.createElement("img");
+      img.src = url;
+      img.className = "chat-media";
+      img.loading = "lazy";
+      nodes.push(img);
+    } else if (mime.startsWith("video/")) {
+      const video = document.createElement("video");
+      video.src = url;
+      video.controls = true;
+      video.className = "chat-media";
+      video.preload = "none";
+      nodes.push(video);
+    } else if (mime.startsWith("audio/")) {
+      const audio = document.createElement("audio");
+      audio.src = url;
+      audio.controls = true;
+      audio.className = "chat-media";
+      audio.preload = "none";
+      nodes.push(audio);
+    } else {
+      const a = document.createElement("a");
+      a.href = url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = url;
+      nodes.push(a);
+    }
+
+    nodes.push(document.createTextNode(" "));
+  }
+
+  return nodes;
+}
+
+/* ---------- display incoming message (decrypt if needed) ---------- */
+async function displayIncomingMessage(rawMsg) {
+  let textToShow = '';
+  let failedDecrypt = false;
+
+  if (rawMsg.encrypted) {
+    if (!sharedKey) {
+      textToShow = '[Encrypted message — provide passphrase to view]';
+      failedDecrypt = true;
+    } else {
+      try {
+        textToShow = await decryptMessageBase64(rawMsg.encrypted);
+      } catch (err) {
+        console.warn('Decrypt failed:', err);
+        textToShow = '[Encrypted message — decryption failed]';
+        failedDecrypt = true;
+      }
+    }
+  } else if (rawMsg.text) {
+    textToShow = rawMsg.text;
+  } else {
+    textToShow = '[Empty message]';
+  }
+
+  const div = document.createElement('div');
+  const time = new Date((rawMsg.timestamp || Math.floor(Date.now()/1000)) * 1000);
+  const timeStr = time.toLocaleTimeString();
+  const isSelf = rawMsg.user === "{{ username }}";
+
+  div.className = 'msg ' + (isSelf ? 'self' : 'other');
+
+  const header = document.createElement('div');
+  header.style.marginBottom = '6px';
+  const strong = document.createElement('strong');
+  strong.textContent = rawMsg.user || 'Unknown';
+  const tsSpan = document.createElement('span');
+  tsSpan.className = 'timestamp';
+  tsSpan.textContent = ' ' + timeStr;
+  header.appendChild(strong);
+  header.appendChild(tsSpan);
+  div.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'msg-body';
+  const nodes = await renderMessageContentNodes(textToShow);
+  if (nodes.length === 0) body.appendChild(document.createTextNode(''));
+  else nodes.forEach(n => body.appendChild(n));
+
+  if (failedDecrypt) {
+    const warn = document.createElement('div');
+    warn.style.marginTop = '6px';
+    warn.style.fontSize = '0.85rem';
+    warn.style.opacity = '0.9';
+    warn.style.color = '#ffd280';
+    warn.textContent = 'Message encrypted — passphrase missing or wrong.';
+    body.appendChild(warn);
+  }
+
+  div.appendChild(body);
+  messagesDiv.appendChild(div);
+  setTimeout(() => { messagesDiv.scrollTop = messagesDiv.scrollHeight; }, 60);
+}
+
+/* ---------- socket.io setup ---------- */
+const socket = io();
+
+socket.on('chat_history', async (arr) => {
+  messagesDiv.innerHTML = '';
+  for (const m of arr) {
+    await displayIncomingMessage(m);
+  }
+});
+socket.on('receive_message', async (m) => {
+  await displayIncomingMessage(m);
+});
+
+/* ---------- send flow ---------- */
+async function sendMessage(text) {
+  // ensure derivation finished if in progress
+  if (derivingPromise) {
+    updateStatus('Waiting for key derivation to finish…');
+    try { await derivingPromise; } catch(e){ /* ignore - setPassphrase handles status */ }
+  }
+
+  const ts = Math.floor(Date.now()/1000);
+  if (sharedKey) {
+    try {
+      const payload = await encryptMessageText(text);
+      // send to server - will be broadcast back via receive_message
+      socket.emit('send_message', { encrypted: payload, timestamp: ts });
+      return;
+    } catch (err) {
+      console.error('Encryption failed — will send plaintext fallback:', err);
+      // fallthrough to plaintext send
+    }
+  }
+  
+  // plaintext send - server will broadcast back
+  socket.emit('send_message', { text, timestamp: ts });
+}
+
+chatForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const text = msgInput.value.trim();
+  if (!text) return;
+  if (!ready && !derivingPromise) {
+    // Shouldn't happen, but fallback
+    alert('Client not ready yet — try again in a moment.');
+    return;
+  }
+  try {
+    // temporarily disable input to avoid double submit
+    chatForm.querySelector('button[type="submit"]').disabled = true;
+    await sendMessage(text);
+  } catch (err) {
+    console.error('Send failed:', err);
+    alert('Failed to send message: ' + err.message);
+  } finally {
+    chatForm.querySelector('button[type="submit"]').disabled = false;
+    msgInput.value = '';
+    msgInput.focus();
+  }
+});
+
+/* ---------- passphrase prompt + utility ---------- */
+async function askPassphraseAtLoad() {
+  try {
+    const pass = prompt('Enter chat passphrase (shared with friends). Leave empty to use plaintext chat:');
+    // explicit empty string or null both treated as plaintext off
+    await setPassphrase(pass);
+  } catch (err) {
+    console.error('Failed to set passphrase at load:', err);
+    // allow plaintext fallback
+    await setPassphrase(null);
+  }
+}
+
+/* allow runtime change */
+function promptChangePassphrase() {
+  const pass = prompt('Enter new chat passphrase (leave empty to disable encryption):');
+  setPassphrase(pass).then(() => {
+    if (!pass) alert('Encryption disabled — plaintext mode.');
+    else alert('Passphrase set. New outgoing messages will be encrypted.');
+  }).catch(err => {
+    alert('Failed to set passphrase: ' + (err && err.message ? err.message : err));
+  });
+}
+
+/* expose small debug helper */
+window._genz_changePassphrase = promptChangePassphrase;
+
+/* ---------- start: ask passphrase on load ---------- */
+ready = false;
+updateStatus('Initialising…');
+askPassphraseAtLoad().then(() => {
+  if (!sharedKey && !passphraseUsed) updateStatus('Plaintext (encryption disabled)');
+}).catch(() => {
+  updateStatus('Ready (plaintext fallback)');
+});
+</script>
+</body>
+</html>
