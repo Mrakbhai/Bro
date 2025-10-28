@@ -1,0 +1,102 @@
+1) What will the site look like to a friend (flow / UX)?
+
+I’ll describe the typical flows: gallery, video playback, download, chat integration. This will help you picture how it behaves compared to your current chat page.
+
+A — Landing / Gallery
+
+Gallery lists videos (thumbnail per item). Thumbnails are encrypted and decrypted client-side after passphrase is entered.
+
+For each video tile you show:
+
+Thumbnail image (decrypted blob)
+
+Title (decrypted from metadata) — if metadata is encrypted, client will decrypt it
+
+Upload time, uploader name (encrypted)
+
+Small indicator: “Processing” or “Ready”
+
+
+B — First-time visitor / opening the site
+
+On page load the client asks for group passphrase.  Passphrase derives content_key client-side.
+
+After passphrase is entered:
+
+Client fetches encrypted manifest for each video it can access (or server sends list of video IDs), decrypts manifest with content_key, then fetches encrypted thumbnails and other encrypted metadata.
+
+Decrypted thumbnails and decrypted titles appear in gallery.
+
+If user doesn’t enter passphrase or wrong: show placeholders and a hint "Enter passphrase to view content. Current passphrase is either wrong or not entered"
+
+C — Clicking a video (playback)
+
+User clicks a video tile → open modal or video page.
+
+Client downloads manifest.enc, decrypts it with content_key. Manifest lists segment filenames + durations + IVs.
+
+Client initializes player (MediaSource/HLS). It then:
+
+Fetches segment 0 (seg_000.enc) as ArrayBuffer from server
+
+Decrypts with WebCrypto using content_key + derived IV
+
+Appends decrypted bytes to SourceBuffer
+
+Continues fetching next segments, maintaining a small prefetch buffer (2–4 segments)
+
+Video begins playback quickly (after first segment appended).
+
+Controls (seek, pause, etc.) work like normal HTML5 player; seeking triggers fetching segment for that position and then decrypting them.
+
+
+D — Download
+
+Download button triggers server to send the already encrypted blobs for small videos, images, then decrypt locally client side. For large videos prompt users with two buttons cancel and continue and message saying 'encrypted blobs will be downloaded instead and you will have to decrypt it manually'. Then if they click continue then start assembling the encrypted segments on client side and writing them to avoid too much ram usage.
+
+
+E — Just like how chat page works currently already set.
+When passphrase is set, chat messages encrypted in storage will be decrypted and displayed. Or else if not entered or wrong then placeholders are displayed.
+
+
+F — Handling images, GIFs, audio, text
+
+Small files (images, text, small gifs) are fetched, decrypted as single blobs and displayed (img.src = blobURL).
+
+GIF playback: you might convert to MP4 for efficiency.
+
+Audio: Unencrypted — plays via native <audio> and range streaming works.
+
+User experience: pretty much the same as before, with the addition of a passphrase step and slight initial delay for decrypting manifests/thumbnails. Once the passphrase is entered, browsing and streaming feels native.
+
+2) DB: metadata.json vs SQLite3
+Both work, but choose based on scale, robustness and concurrency. Here’s a comparison and recommendation.
+
+metadata.json (current)
+
+Pros:
+Simplicity — easy to read & edit, zero dependencies.
+Very lightweight — fits small friend-groups.
+
+Cons:
+Concurrency problems: simultaneous writes can corrupt the file unless you implement locking.
+Performance: reading/writing the whole file for every change gets heavy as number of records grows.
+Crash-safety: risk of partial writes unless you use atomic write (write temp then rename).
+
+sqlite3
+
+Pros:
+Low resource footprint, server-side embedded SQL DB.
+ACID transactions — no corruptions or race conditions.
+Handles concurrent reads/writes safely (with WAL mode).
+Fast lookups for manifests, paging, queries.
+No heavy external dependencies.
+
+Cons:
+Slightly more complex than JSON; need to learn sqlite usage.
+If you have multiple origin servers later, sqlite won’t scale horizontally (but for now you’re single-server so it’s perfect).
+
+
+Recommendation:
+Use sqlite3. It’s still lightweight and solves concurrency and integrity concerns elegantly. You can keep a small JSON export as a backup if you want readability.
+If you absolutely must keep metadata.json: implement robust file locking (flock), atomic writes, and avoid concurrent writes by queuing updates — but sqlite is simpler and safer.

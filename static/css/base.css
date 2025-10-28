@@ -1,0 +1,108 @@
+:root {
+  --primary: #4f46e5;
+  --secondary: #22d3ee;
+  --bg-dark: #0f172a;
+  --text-light: #f1f5f9;
+  --input-bg: rgba(255, 255, 255, 0.1);
+  --radius: 10px;
+  --transition: 0.3s ease;
+  --shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+}
+
+/* Reset & Base Styling */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  font-family: "Poppins", sans-serif;
+}
+
+/* 🌌 Dark Animated Gradient Background applied to body */
+body {
+  color: var(--text-light);
+  min-height: 100vh;
+  margin: 0;
+  padding: 0;
+
+  background: linear-gradient(300deg, #000610, #06165f, #010619, #112365);
+  background-size: 240% 240%;
+  animation: gradient-animation 4s ease infinite;
+  background-attachment: fixed; /* ensures it stays static when scrolling */
+}
+
+/* Login page specific centering */
+body.login-page {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 1rem;
+  overflow: hidden;
+}
+
+/* Keyframes for the background animation */
+@keyframes gradient-animation {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+/* Input & Button Defaults */
+input,
+button {
+  font-size: 1rem;
+  outline: none;
+}
+
+/* Utility class */
+.centered {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+/* ------------------------
+   Shared button utility
+   ------------------------ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0.6rem 0.9rem;
+  min-height: 44px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(255,255,255,0.06);
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+  color: var(--text-light);
+  cursor: pointer;
+  transition: transform 0.12s var(--transition), box-shadow 0.12s var(--transition), background 0.12s var(--transition);
+  box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+  font-weight: 600;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.btn:active { transform: translateY(1px) scale(0.997); }
+.btn:focus { outline: 2px solid rgba(79,70,229,0.18); outline-offset: 2px; }
+
+/* Mobile-optimized touch targets */
+@media (max-width: 768px) {
+  .btn {
+    min-height: 48px;
+    padding: 0.7rem 1rem;
+    font-size: 1rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .btn {
+    min-height: 48px;
+    padding: 0.75rem 1.1rem;
+  }
+}

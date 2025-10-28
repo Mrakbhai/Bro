@@ -1,0 +1,208 @@
+I’ll deliver a finalized step-by-step design and tech stack that covers everything: HLS + re-encryption for cacheability, encrypted manifests, thumbnails (including GIFs), handling images/audio/txt, chunked client upload, key derivation & IV rules for caching friendliness, sizes/parameters, and operational notes for low-end server.
+
+I’ll break it into sections: 1) High-level pipeline, 2) Artifacts & storage layout, 3) Key/IV derivation and manifest encryption (caching friendliness), 4) Upload strategy & chunking, 5) Server processing (workers/cores/queue), 6) Formats & per-media handling (video, gif, images, audio, text), 7) Playback & client responsibilities, 8) Security & operational best practices, 9) Parameter summary (concrete values), and 10) deployment / monitoring notes.
+
+1) High-level pipeline
+
+1. Group key established
+A group content passphrase/key is agreed among the friends (out-of-band). From that passphrase clients derive group_master_key (KDF). Server may also hold this key, or it can unwrap it if needed.
+
+2. Client-side upload encryption
+Client encrypts the upload in streaming/chunked fashion with group_master_key to prevent Cloudflare/Tunnel from seeing plaintext. Chunks are uploaded sequentially (4–16 MiB chunk size recommended).
+
+3. Server receives encrypted upload
+Server decrypts (or writes encrypted blob and decrypts offline) using group_master_key to a temporary plain file in a staging folder.
+
+4. Server queues processing job
+A background worker picks the job (throttled concurrency) and runs ffmpeg to transcode/segment for streaming.
+
+5. Server processes video into HLS/fMP4 segments
+Produce segments (4–10s each; 6s recommended) and a segment manifest (JSON or .m3u8).
+
+6. Server re-encrypts final segments with content key
+Derive a stable content_key from group_master_key via HKDF so that ciphertext is identical across viewers (deterministic per segment IV derivation). Encrypt each segment with AES-GCM, store ciphertext files.
+
+7. Server creates & encrypts manifest + thumbnails
+Create a manifest JSON listing segments, durations, content IDs, and IVs (or derivation rule). Encrypt whole manifest with the same content_key (AES-GCM) before storing/serving. Generate thumbnails (jpg) and encrypt them with content_key.
+
+8. Store artifacts (encrypted segments, encrypted manifest, enc. thumbnails) in a per-video folder
+Publish metadata record (video_id, public info) to DB. Notify uploader that processing has started.
+
+9. Viewer fetch + play
+Viewer requests manifest (encrypted), derives content_key locally from passphrase, decrypts manifest, then fetches encrypted segments, decrypts each on the fly in browser (WebCrypto), append to MSE (or use HLS player if you choose fMP4/hls.js approach), and show thumbnails (decrypted).
+
+2) Storage layout (recommended)
+
+Organize files per video id for easy life-cycle management and caching.
+
+/storage/videos/
+  <video_id>/
+    segments/
+      seg_000.enc
+      seg_001.enc
+      ...
+    manifest.enc        # encrypted JSON manifest (includes segment list)
+    thumb.jpg.enc        # encrypted default thumbnail (or variants)
+    preview.mp4.enc      # optional short preview
+    meta.json            # minimal public metadata: {video_id, date, owner_id}
+
+Keep a separate DB/JSON mapping for user ownership, upload status, processing status, and salts/KDF metadata (but do not store plaintext content_key if you want to limit server access)
+
+3) Key derivation, IV derivation, and manifest encryption (caching-friendly)
+
+This section is critical: how to make encrypted segments identical across viewers (so CDN caching works) while being secure.
+
+A. Key derivation
+
+Input: user/group passphrase (high entropy if possible) or a pre-shared 256-bit key.
+Do: content_key = HKDF( salt = group_salt, input_key_material = PBKDF2(passphrase, saltForKDF) )
+Or simpler: content_key = HKDF(passphrase || group_salt) but recommended approach is: master = PBKDF2(passphrase, salt1, iter) then content_key = HKDF(master, info="content-key", length=32).
+Store: group_salt and KDF parameters (kdf=PBKDF2, iter) in the manifest metadata (not secret).
+
+B. IV derivation — deterministic & unique per segment
+
+For reproducible ciphertext (cacheable) you must determine IV deterministically per segment using content_key:
+iv_i = truncate12( HMAC-SHA256(content_key, video_id || ":" || segment_index) )
+Truncate to 12 bytes for AES-GCM IV.
+This is deterministic, unique for each (video_id, segment_index), and avoids random IVs that would cause different ciphertexts per viewer.
+Must ensure never to reuse the same IV for different segments under same key. Using video_id+index ensures uniqueness per segment.
+
+C. Manifest encryption
+
+Manifest JSON (includes segment filenames, durations, IVs optional) should be encrypted with AES-GCM using content_key.
+For manifest IV, use deterministic IV too (e.g. truncate12(HMAC(content_key, video_id || ":manifest"))) OR a random IV stored alongside the encrypted manifest — either is fine. If you use random IV, store it plaintext in DB for clients.
+Manifest encryption gives Cloudflare zero visibility into segment ordering / file names, protecting metadata too.
+
+D. Per-small-blob encryption (images, gifs, txt)
+
+Use AES-GCM with a per-blob IV:
+For cacheability, if you want identical ciphertexts across viewers, derive IV deterministically per blob similar to segments.
+For small items you can store base64(iv + ciphertext) in DB or files.
+
+4) Client upload strategy & chunk sizes
+
+Goal: avoid too high memory on client and be robust on varying devices.
+Chunking approach
+Read file via File.slice() or stream API.
+Use chunk size: 4 MiB to 16 MiB (4 MiB is safest for low-end clients; 8–16 MiB better for speeds).
+
+For each chunk:
+
+Encrypt chunk with AES-GCM using an upload key (can be same as group key). Use per-chunk random IVs during upload OR deterministic IVs tied to chunk index if you want reconstructable uploaded ciphertext. Save IV alongside chunk metadata.
+Upload chunk sequentially (POST) or via resumable upload protocol (range/Content-Range). Sequential is simpler.
+
+Why chunk upload (benefits)
+
+Keeps memory usage low (only one chunk buffered).
+Simpler retry model: re-upload failed chunk rather than whole file.
+Resume ability: store uploaded chunk indices on server.
+
+Upload tips
+
+Use Content-Range style or a simple chunked protocol /upload?video=tmpid&part=i.
+Ensure server writes decrypt/append to disk as it receives chunk to avoid holding the whole file in RAM.
+If clients encrypt before upload, server must have key to decrypt per-chunk on the fly or store encrypted full blob and decrypt later.
+
+5) Server-side processing, multi-core use & job queue
+
+Server is low-end, but ffmpeg is CPU bound. Use careful job management.
+
+A. Job queue model
+Simple disk-backed queue (sufficient for low-end machines): store jobs as small JSON files in queue/ and have a worker process poll them. This avoids adding Redis/Celery complexity.
+Lightweight queue workers: spawn N worker processes (N = number of cores you want to use for ffmpeg). Since ffmpeg is CPU heavy, typically set N = min(1, available_cores-1) on low-end server. On a Snapdragon 425 device, use N=1 or N=2 only with care.
+Use ffmpeg -threads 1 inside each job to avoid oversubscription, or tune threads per job.
+
+B. Use separate process (not thread)
+Use separate processes for ffmpeg to avoid Python GIL and to isolate memory. Each worker spawns ffmpeg as a subprocess — ideal.
+Example: have a master process (Flask) accept uploads and enqueue jobs; a pool of 1-2 worker processes run ffmpeg jobs from the queue.
+
+C. Resource management
+Throttle concurrency: limit number of simultaneous ffmpeg runs (1).
+Disk I/O: heavy if many simultaneous jobs — ensure there is enough disk bandwidth and free space.
+nice/ionice: run ffmpeg with nice and ionice to reduce system impact on interactive services.
+Swap caution: try to avoid swap thrashing on 2 GB RAM. Limit ffmpeg memory usage and queue longer jobs.
+
+D. Background tasks & notifications
+During processing, update DB status: processing and estimate ETA (size / typical processing speed) after some seconds, avoid updating rapidly and precisely to save resources. Notify uploader via websocket/message when starting tell them that you upload has started it will take some time to process.
+
+6) Media-specific handling (detailed)
+
+Video (primary flow)
+
+Processing:
+On server, decrypt original (if encrypted) and create:
+HLS with fMP4 segments (CMAF) OR HLS with TS segments. I recommend fMP4 (modern, MSE friendly).
+Segment duration: 4–10s (6s recommended for balance).
+Create a per-segment file and a manifest.
+
+Final encryption:
+Re-encrypt each segment with content_key using deterministic IVs (as outlined).
+Encrypt manifest JSON.
+
+Thumbnails:
+
+Extract a thumbnail (ffmpeg -ss frame) before encrypting. Encrypt thumbnail(s) with content_key.
+Storage: per-video folder, segmented files, encrypted.
+
+GIFs
+
+GIFs are typically large for long animations and not efficient. Options:
+Convert to a MP4 (H.264) for thumbnails. MP4 is streamable and smaller in the same videos encrypted way.
+Always generate a static thumbnail (jpg) for gallery listing; encrypt that.
+
+Images (photos)
+
+Encrypt entire file as one blob with AES-GCM and store photo.jpg.enc. Use deterministic IV derivation (video_id or file_id) if you want caching across viewers.
+
+Audio
+
+Audio may remain unencrypted. If so, serve as normal unencrypted file (range streaming works). You can still obfuscate filenames and keep metadata encrypted.
+
+7) Playback & client responsibilities
+
+Manifest fetch: client fetches manifest.enc, derives content_key, decrypts manifest with WebCrypto. Manifest reveals segment list and IVs OR provides IV derivation rule.
+Segment fetch: fetch seg_XXX.enc as ArrayBuffer, decrypt with AES-GCM (WebCrypto) using content_key and supplied IV, append to MSE buffer for playback.
+Thumb fetch: fetch thumb.jpg.enc, decrypt and create blob: URL for img.src.
+Prefetching: keep a small prefetch buffer of 2–4 segments.
+Retry & fallback: implement retries for segment fetch / decryption; fallback to full file download if streaming fails.
+
+8) Security & operational concerns (what to take care of)
+
+IV safety: never reuse the same IV for the same key across different data. The derivation scheme ensures uniqueness for segments.
+Authenticated encryption: always use AES-GCM (or AES-CTR + HMAC) so ciphertext tampering is detected.
+Key secrecy: treat group passphrase with caution.
+KDF parameters: choose PBKDF2 iterations with client performance in mind. Document KDF metadata in DB/manifest so clients know how to derive key.
+Manifest protection: encrypt the manifest; if manifest is plaintext, it leaks structure.
+Logging: avoid logging sensitive values (IVs okay; keys must never be logged). Mask logs that touch file contents.
+Backups: back up salts & manifests, but keep keys out of backups if you aim to restrict server access.
+Quota and abuse control: limit upload sizes, rate limit uploads per user to prevent denial-of-service or accidental overload.
+Disk cleanup: implement lifecycle rules to remove temp plain file quickly.
+
+9) Concrete parameter recommendations (one place)
+
+KDF: PBKDF2 with SHA-256, iterations = 150,000. Salt length = 16 bytes random. (If clients are powerful and you want more security, 250k or 300k is ok.)
+Content key: 256 bits (32 bytes).
+HKDF: use HKDF-SHA256 to derive subkeys (content key, HMAC key).
+Encryption: AES-GCM-256 (IV = 12 bytes)
+IV derivation: iv = truncate12(HMAC-SHA256(content_key, video_id || ":" || segment_index)).
+Upload chunk size: 4 MiB ← safe for older mobiles; 8–16 MiB for faster networks/devices.
+Segment duration: 6 seconds per segment (4–10s acceptable).
+Worker concurrency: 1 ffmpeocess by default on your server; scale toe to 2 only if testing shows acceptable memory and CPU usage. Use ffmpeg -threads 1.
+Prefetch buffer on client: 2–4 segments.
+Thumbnail size: 320×180 (or responsive sizes: 320/720/1080 variants), store small jpg for gallery listing.
+Storage TTL: temp plaintext files deleted immediately after processing.
+
+10) Deployment & monitoring notes
+
+Queue dashboard: to view pending/processing jobs, with retry/cancel on server with maybe a command line program
+Health checks: monitor CPU, free RAM, disk usage, ffmpeg failure rate, and job queue length.
+Backpressure: if queue grows, reject new uploads or show longer ETA.
+Use CDN caching: set Cache-Control: public, max-age=... for encrypted segment files so Cloudflare caches them. Because ciphertexts are identical, caching is safe.
+Testing: test with a variety of client devices (iOS/Android/desktop), network conditions, and with corrupted segments to ensure the player recovers.
+
+Final recommended staged plan (what to build first)
+1. Implement chunked client upload (encrypted) and server-side assembly & decrypt to plaintext (staging). Show upload progress + processing ETA. (This prevents Cloudflare seeing plaintext during upload.)
+2. Implement the simple background queue + single worker that runs ffmpeg to create segments and thumbnails, stores them unencrypted initially.
+3. Implement deterministic re-encryption of segments + manifest using content_key and storage layout. Save manifest.enc and seg_*.enc files.
+4. Implement client code to decrypt manifest + fetch/decrypt segments and play via MSE (or hls.js with fMP4). Also decode thumbnail.
+5. Add multiple workers only if needed — tune concurrency after you have production data on CPU/DISK usage.

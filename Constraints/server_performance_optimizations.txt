@@ -1,0 +1,444 @@
+I’ll give you a concrete, prioritized plan you can implement today: design decisions, endpoints, DB changes, worker/queue behavior, thresholds and heuristics to detect high load, UI behavior (lazy loading, modals, progress bars, notifications), and failure modes + user messages. No code yet — but everything is specific enough to implement directly.
+
+I’ll structure it as:
+
+1. Goals & constraints (short)
+
+
+2. UX behavior (what users see)
+
+
+3. Server architecture changes (queue, workers, throttles)
+
+
+4. Endpoints & DB/metadata changes
+
+
+5. Resource checks / heuristics & thresholds
+
+
+6. Upload/download/processing flow (including deferred processing)
+
+
+7. Pagination & lazy-loading strategy
+
+
+8. Progress indicators, sockets & notifications
+
+
+9. Failure modes & user-facing messages
+
+
+10. Prioritized implementation checklist (what to do first)
+
+
+
+
+1) Goals & constraints
+
+Low-RAM server (≈2 GB) — heavy ffmpeg jobs must be scheduled carefully.
+
+Keep UI snappy: paginate gallery, lazy-load heavy blobs only when needed, show clear progress and status messages.
+
+Allow encrypted upload at any time but defer CPU/memory-heavy preprocessing (ffmpeg) when server is busy — store encrypted blobs immediately.
+
+Inform users when server is too busy to process or to accept large downloads/processing.
+
+Use socket.io (already in your app) to push job status and progress.
+
+
+
+2) UX: what users will experience
+
+Gallery page:
+
+Shows paginated thumbnails & titles only (client fetches metadata, not media).
+
+Thumbnails are fetched (and decrypted) lazily as tiles come into viewport (intersection observer) OR when modal opens.
+
+
+Modal / Video page:
+
+On open: fetch encrypted manifest (small) and show decrypted title/description. Do not fetch segments until user presses Play.
+
+Play button: starts prefetch of first segment(s) and shows streaming progress (small spinner → playback).
+
+Upload page:
+
+Chunked upload progress bar shows upload % and upload rate.
+
+After upload completes you see a “Processing queued” banner with ETA (estimation or “queued”).
+
+
+
+Notifications:
+
+If server RAM is low / queue is full show immediate notification and either reject or queue upload with a warning.
+
+When processing finishes, notify via toast/socket and update gallery tile to “Ready”.
+
+
+3) Server architecture (queue, workers, throttles)
+
+Keep it simple and robust.
+
+Components
+
+Flask app (main): accepts uploads, returns metadata, enqueues jobs, serves static encrypted files.
+
+Job queue: file-backed queue (directory jobs/) or sqlite table jobs (recommended). Keeps job records: id, video_id, uploader, status, size, created_at.
+
+Worker pool: 1–2 worker processes (spawn by systemd / supervisor). Each worker:
+
+Checks resource heuristics before starting job.
+
+Runs ffmpeg in a subprocess with -threads 1 and bounded memory approach.
+
+Re-encrypts segments and writes manifest.
+
+
+Controller (scheduler): decides when to start jobs, enqueues tasks and triggers workers.
+
+Socket notifier: use existing socket.io to push job status updates to uploader and to gallery users.
+
+
+Behavior & safeguards
+
+Limit concurrent workers to W = 1 by default. If server tested stable, W=2 possible.
+
+Worker checks resource thresholds (RAM, load) before starting a job; if thresholds exceeded, worker sleeps and rechecks.
+
+Jobs have priority: interactive uploads from same group get higher priority or you can use FIFO.
+
+Job retries: if ffmpeg fails, retry R times (e.g., 2) with exponential backoff.
+
+
+4) Endpoints & DB / metadata changes
+
+You currently have metadata.json. Move to sqlite3 for reliability and concurrency. Minimal schema:
+
+SQLite tables
+
+videos (video_id TEXT PRIMARY KEY, owner TEXT, status TEXT, size INTEGER, created_at INTEGER, updated_at INTEGER, title_enc TEXT, salt TEXT, manifest_path TEXT, thumb_path TEXT)
+
+jobs (job_id PK, video_id, type TEXT, status TEXT, attempts INTEGER, queued_at, started_at, finished_at, eta_seconds INTEGER, priority INTEGER)
+
+users (user_id, username, ...) — optional
+
+
+APIs
+
+POST /upload/chunk?video_id=...&part=... — upload chunk (store encrypted chunk)
+
+POST /upload/complete — signal finished upload → returns job_id
+
+GET /videos?page=1&per=24 — paginated metadata (no blobs)
+
+GET /video/<id>/manifest.enc — fetch encrypted manifest (small) — client decrypts
+
+GET /video/<id>/thumb — fetch decrypted (or server can decrypt and send) — better to serve encrypted and let client decrypt if passphrase is present
+
+POST /video/<id>/download — request server-side decrypted download (checks resources, returns streaming response or queued)
+
+GET /job/<id>/status or socket events for status updates
+
+
+Keep file-system layout per earlier: storage/videos/<video_id>/...
+
+Atomic metadata writes: use sqlite writes or atomic JSON writes with temp file + rename if you keep JSON.
+
+
+
+5) Resource checks / heuristics & thresholds
+
+These are the practical numbers to start with; tune later.
+
+Use psutil (Python) on server to inspect:
+
+mem = psutil.virtual_memory()
+
+swap = psutil.swap_memory()
+
+load = psutil.getloadavg() (if available)
+
+
+Heuristics (initial conservative defaults)
+
+RAM threshold: start processing only if mem.available > 600 MB (on 2GB server) and mem.percent < 72%.
+
+Swap threshold: swap.used < 200 MB (prefer zero swap).
+
+Load average: 1-min load < 1.0 * num_cores (for mobile cores, be conservative). For single-worker, check load < 2.0.
+
+Disk free: disk_free > filesize * 2 + 1GB (ensure enough space for temp decrypted + segments).
+
+Concurrent downloads: limit to D = 2 simultaneous server-side decrypted downloads (configurable).
+
+
+If checks fail → worker postpones job and updates DB job status to waiting_resource with an estimated retry time; socket notifies uploader "Processing deferred due to server load."
+
+
+
+6) Upload / download / processing flow (detailed)
+
+This is the core behavior you asked for.
+
+Upload flow (client)
+
+1. Client slices file into chunks (4–8 MiB recommended).
+
+
+2. For each chunk, client encrypts (AES-GCM) and POSTs to /upload/chunk.
+
+
+3. Server appends chunk to temp encrypted file (or stores chunks) and returns progress.
+
+
+4. Client calls /upload/complete with metadata (size, name, etc.). Server:
+
+Creates videos DB row with status = uploaded.
+
+Stores encrypted blob path.
+
+Enqueues a job in jobs table: type=process_video, status=queued.
+
+
+
+
+Server handling after upload
+
+Immediately: store encrypted blob on disk (this saves user upload; processing can be deferred).
+
+Notify uploader that upload succeeded and processing queued.
+
+Scheduler/worker will later pick job and check resources. If OK:
+
+Decrypt encrypted blob to plaintext temp file (if client encrypted pre-upload).
+
+Run ffmpeg (transcode/segment), create segments.
+
+Re-encrypt segments deterministically and write manifest.enc.
+
+Update videos.status = ready, remove temp plaintext.
+
+Notify uploader via socket: processing_done.
+
+
+
+If resources insufficient:
+
+Worker marks job waiting_resource and sets retry_at = now + backoff.
+
+Notify uploader: "Processing deferred — server busy. We'll start automatically when resources free."
+
+
+Download flow
+
+If user clicks download:
+
+Server checks resource heuristics.
+
+If OK, start streaming decrypted file on-the-fly (read encrypted segments, decrypt using content_key, stream bytes) with Content-Disposition: attachment.
+
+If not OK, either:
+
+queue the download job and notify user when ready (preferred), or
+
+reject and show a friendly error with ETA.
+
+
+
+
+Important: To conserve RAM, stream decrypt and write to response chunk by chunk rather than assembling full file in memory.
+
+
+7) Pagination & lazy-loading strategy
+
+Keep gallery light and load heavy items only when necessary.
+
+Server-side pagination
+
+Endpoint GET /videos?page=N&per=24 returns minimal metadata:
+
+video_id, thumb_path (encrypted URL), title_enc, status, size, created_at, processing_status.
+
+
+Use SQL LIMIT & OFFSET or cursor pagination using created_at for better scaling.
+
+
+Client-side
+
+On gallery load: fetch page 1 metadata only.
+
+Thumbnails:
+
+Use IntersectionObserver to lazy-load thumbnails as tiles enter viewport.
+
+Use small thumbnail files (e.g., 320×180) to minimize bandwidth and decryption cost.
+
+
+Modal open:
+
+Only when modal opens, fetch manifest.enc and show details; do not fetch segments yet.
+
+If user presses Play, then start prefetching segments.
+
+
+Comments:
+
+Paginate comments separately; fetch only when modal opens and user scrolls to comments.
+
+
+
+This reduces network and memory use greatly.
+
+
+8) Progress indicators, sockets & notifications
+
+Use combination of XHR/fetch progress and socket.io.
+
+Upload progress
+
+Use XMLHttpRequest with xhr.upload.onprogress to show percent uploaded.
+
+Also show chunk-level progress (chunk N of M).
+
+When upload completes, show Queued for processing banner and job id.
+
+
+Processing progress
+
+Worker emits events via socket.io:
+
+job_progress with {job_id, step: "decrypt", percent: 10} etc.
+
+job_started, job_phase (transcoding, segmenting, encrypting), job_percent.
+
+job_done with video_id and manifest_url.
+
+
+Display a progress bar that shows combined pipeline % or textual phases.
+
+
+Playback buffer indicator
+
+In player, show small prefetch buffer indicator (e.g., "Buffered 12s / 30s").
+
+Show segment download/decrypt progress spinner.
+
+
+System notifications
+
+When resource heuristics block processing, emit server_busy message to uploader:
+
+Example: "Processing delayed: server RAM high (70%). Your video is queued and will start automatically when resources free. Estimated wait: ~12 minutes."
+
+
+
+Retry & ETA
+
+Use conservative ETA: estimate processing time as size(GB) * 4–10 minutes per GB depending on your benchmark; or use a moving average from real job times. Show "Estimated processing time: ~X minutes" not exact.
+
+
+
+9) Failure modes & user-facing messages
+
+Design human-friendly messages.
+
+Upload fail:
+
+"Upload failed — network error. Please retry."
+
+
+Processing deferred:
+
+"Processing delayed: server busy. Your video is queued and will be processed automatically when resources allow. We’ll notify you when it’s ready."
+
+
+Processing failed:
+
+"Processing failed: <short reason>. We will retry automatically. If it fails again, contact admin."
+
+
+Download unavailable due to server load:
+
+"Download temporarily unavailable due to server load. Add to download queue or try again later."
+
+
+Decryption fail (client):
+
+"Unable to decrypt manifest/segment. Check passphrase."
+
+
+Storage low:
+
+"Upload cannot be accepted — server storage is low. Try smaller file or contact admin."
+
+
+Be explicit about options: "Queue download" vs "Try now", and allow user to cancel queued jobs.
+
+
+
+10) Prioritized implementation checklist (concrete steps)
+
+Do these in order — each step unlocks the next.
+
+1. Migrate metadata to sqlite3 (safe, ACID). Add videos and jobs tables.
+
+
+2. Implement chunked encrypted upload API and UI upload progress bar. Store encrypted blobs immediately.
+
+
+3. Implement job queue + single worker that:
+
+Picks jobs,
+
+Checks resource thresholds before starting,
+
+Runs ffmpeg with -threads 1,
+
+Writes manifest & encrypted segments,
+
+Updates DB & emits socket events.
+
+
+
+4. Add resource monitor (psutil) and the heuristics described; have scheduler defer jobs if overloaded.
+
+
+5. Implement gallery pagination + lazy thumbnail loading (IntersectionObserver).
+
+
+6. Implement modal behavior: fetch manifest encrypted on open, decrypt on client, start segment fetch on Play.
+
+
+7. Implement server-side decrypted download endpoint (streams decrypted file chunk-by-chunk).
+
+
+8. Add user notifications & job status via socket.io.
+
+
+9. Tuning: measure actual ffmpeg times, adjust RAM thresholds, worker concurrency, chunk sizes.
+
+
+10. Add admin UI to view/kill/cancel/retry jobs, free disk, etc.
+
+
+
+Extra practical tips & small details
+
+Atomic writes: write to file.tmp then os.rename() to avoid partially written artifacts.
+
+Temp plaintext cleanup: after processing, securely delete plaintext temp files immediately.
+
+Job priority: let uploader's recent activity or small files jump the queue; implement priority field.
+
+Disk quotas: enforce per-user storage and maximum file size.
+
+Metrics: log job durations and resource usage (seconds per GB) to improve ETA accuracy.
+
+Testing: test with different file sizes and devices. Simulate low RAM by running additional load.
+
+Backoff policy: if job deferred repeatedly, notify uploader with an escalation (offer manual override?).
+
+Edge case: if many users request download simultaneously, prefer queuing server-side decrypted downloads rather than concurrent decryption—keeps memory stable.
